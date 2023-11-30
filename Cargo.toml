@@ -1,7 +1,8 @@
 [package]
 name = "fhex"
+description = "A crate providing the ToHex trait for converting floating-point numbers to hexadecimal."
 version = "1.0.0"
-authors = ["Rod Vagg <rod@vagg.org>"]
+authors = ["Rod Vagg <r@va.gg>"]
 repository = "https://github.com/rvagg/fhex"
 edition = "2021"
 license = "Apache-2.0"
