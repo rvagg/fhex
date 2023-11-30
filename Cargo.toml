@@ -1,0 +1,9 @@
+[package]
+name = "fhex"
+version = "1.0.0"
+authors = ["Rod Vagg <rod@vagg.org>"]
+repository = "https://github.com/rvagg/fhex"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
