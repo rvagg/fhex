@@ -1,62 +1,66 @@
 # fhex
 
-`fhex` is a Rust crate that provides the `ToHex` trait for converting floating-point numbers to their hexadecimal representation. The trait is implemented for `f32` and `f64` types.
+[![Crates.io](https://img.shields.io/crates/v/fhex.svg)](https://crates.io/crates/fhex)
+[![Documentation](https://docs.rs/fhex/badge.svg)](https://docs.rs/fhex)
 
-The hexadecimal representation follows the format specified for the IEEE 754 standard, `±0xh.hhhp±d`, described below.
+Hex float conversion for Rust: `ToHex` for formatting, `FromHex` for parsing.
 
-To parse hexadecimal floating point numbers, see the [hexf](https://crates.io/crates/hexf) crate.
+Uses the [IEEE 754 hexadecimal floating-point](https://en.wikipedia.org/wiki/Hexadecimal_floating_point) format (`±0xh.hhhp±d`)—the same format used by C's `%a` printf specifier, Java's `Double.toHexString()`, and the WebAssembly text format.
+
+**[Documentation](https://docs.rs/fhex)** · **[Crates.io](https://crates.io/crates/fhex)**
 
 ## Usage
 
-Add `fhex` to your `Cargo.toml` dependencies:
-
 ```toml
 [dependencies]
-fhex = "1.0.0"
+fhex = "2.0"
 ```
-
-Then, import the `ToHex` trait in your code:
 
 ```rust
-use fhex::ToHex;
-```
+use fhex::{ToHex, FromHex};
 
-You can now call the `to_hex` method on any `f32` or `f64` value:
+// Formatting
+let hex = 3.0_f64.to_hex();
+assert_eq!(hex, "0x1.8p+1");
 
-```rust
-let num: f32 = 1.23;
-let hex = num.to_hex();
-println!("{}", hex);
-```
+// Parsing
+let value = f64::from_hex("0x1.8p+1").unwrap();
+assert_eq!(value, 3.0);
 
-This will print the hexadecimal representation of 1.23.
-
-```
-0x1.3ae148p+0
+// Round-trip
+let original = std::f64::consts::PI;
+let roundtrip = f64::from_hex(&original.to_hex()).unwrap();
+assert_eq!(original, roundtrip);
 ```
 
 ## Format
 
-Floating point numbers are represented in the format: `±0xh.hhhp±d`, where:
+Floating point numbers are represented as `±0xh.hhhp±d`, where:
 
-* `±` is the sign of the number, although `+` is omitted for positive numbers.
-* `0x` is the prefix for hexadecimal numbers.
-* `h.hhh` is the significand (also known as the mantissa), represented as a hexadecimal number.
-* `p` indicates that the following number is the exponent.
-* `±d` is the exponent, represented as a decimal number.
+* `±` is the sign (`-` for negative, omitted for positive)
+* `0x` is the hex prefix
+* `h.hhh` is the significand in hexadecimal
+* `p±d` is the exponent in decimal (base 2)
 
-Special cases:
+Special values:
 
-* `±0x0p+0` is used to represent zero.
-* `±inf` is used to represent infinity.
-* `nan` is used to represent NaN (a "quiet NaN").
-* `nan:0x` followed by a hexadecimal number is used to represent a NaN with a payload (a "signalling NaN").
+* `±0x0p+0` for zero
+* `±inf` for infinity
+* `nan` for quiet NaN
+* `nan:0x...` for NaN with payload (signalling NaN)
 
-### Known differences with other implementations
+## Parsing Features
 
-* Go's `%x` format specifier for floating point numbers uses the format `±0xh.hhhp±d`, but it insists on printing the exponent with at least two digits, zero padded. Infinity is represented as `±Inf` and NaN as `NaN`. There is no special treatment of signalling NaNs.
-* C++'s `std::hexfloat` format specifier for floating point numbers uses the format `±0xh.hhhp±d`. There is no special treatment of signalling NaNs, they are just `nan`.
+* Underscores for readability: `0x1_000p+0`
+* NaN payloads preserved: `nan:0x123`
+* Case-insensitive: `INF`, `NaN`, `0X1P+0`
+* Whitespace trimmed
+
+## Output Differences vs Other Languages
+
+* **Go's `%x`**: Uses `±Inf` and `NaN` (capitalised), zero-pads exponent to 2 digits
+* **C++ `std::hexfloat`**: No special NaN payload handling
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](./LICENSE) file for details.
+Apache-2.0

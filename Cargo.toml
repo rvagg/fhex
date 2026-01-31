@@ -1,10 +1,18 @@
 [package]
 name = "fhex"
-description = "A crate providing the ToHex trait for converting floating-point numbers to hexadecimal."
-version = "1.0.0"
+description = "Hex float conversion: ToHex for formatting, FromHex for parsing. IEEE 754 hexadecimal format (0x1.8p+1)."
+version = "2.0.0"
 authors = ["Rod Vagg <r@va.gg>"]
 repository = "https://github.com/rvagg/fhex"
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
+keywords = ["float", "hex", "wasm", "wat", "ieee754"]
+categories = ["encoding", "parsing", "value-formatting"]
 
 [dependencies]
+
+[dev-dependencies]
+proptest = "1.9"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(kani)"] }
