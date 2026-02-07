@@ -12,7 +12,7 @@ categories = ["encoding", "parsing", "value-formatting"]
 [dependencies]
 
 [dev-dependencies]
-proptest = "1.9"
+proptest = "1.10"
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ["cfg(kani)"] }
