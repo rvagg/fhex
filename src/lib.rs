@@ -405,8 +405,42 @@ fn from_hex_f32(s: &str) -> Option<f32> {
     }
 }
 
-/// Parse hex float mantissa and exponent (after 0x prefix).
-fn parse_hex_float_f64(s: &str, negative: bool) -> Option<f64> {
+/// IEEE 754 format parameters for hex float parsing.
+struct HexFloatParams {
+    /// Total bits in the format (32 or 64).
+    total_bits: u32,
+    /// Stored significand bits (23 for f32, 52 for f64).
+    sig_bits: u32,
+    /// Exponent bias (127 for f32, 1023 for f64).
+    exp_bias: i64,
+    /// Minimum normal exponent (-126 for f32, -1022 for f64).
+    exp_min: i64,
+    /// Maximum normal exponent (127 for f32, 1023 for f64).
+    exp_max: i64,
+}
+
+const F32_PARAMS: HexFloatParams = HexFloatParams {
+    total_bits: 32,
+    sig_bits: 23,
+    exp_bias: 127,
+    exp_min: -126,
+    exp_max: 127,
+};
+
+const F64_PARAMS: HexFloatParams = HexFloatParams {
+    total_bits: 64,
+    sig_bits: 52,
+    exp_bias: 1023,
+    exp_min: -1022,
+    exp_max: 1023,
+};
+
+/// Parse hex float mantissa and exponent into an IEEE 754 bit pattern.
+///
+/// Uses integer arithmetic with IEEE 754 round-half-to-even to produce
+/// correctly rounded results for any target precision. The returned u64
+/// contains the full bit pattern (sign, exponent, significand).
+fn parse_hex_float_bits(s: &str, negative: bool, p: &HexFloatParams) -> Option<u64> {
     // Split mantissa and exponent at 'p' or 'P'
     let (mantissa_str, exp_str) = if let Some(p_pos) = s.find(['p', 'P']) {
         (&s[..p_pos], &s[p_pos + 1..])
@@ -414,82 +448,194 @@ fn parse_hex_float_f64(s: &str, negative: bool) -> Option<f64> {
         (s, "+0")
     };
 
-    // Parse exponent (base 2)
     let exp_str = exp_str.strip_prefix('+').unwrap_or(exp_str);
-    let exponent: i32 = exp_str.parse().ok()?;
+    let parsed_exp: i64 = exp_str.parse().ok()?;
 
-    // Split mantissa into integer and fractional parts
     let (int_str, frac_str) = if let Some(dot_pos) = mantissa_str.find('.') {
         (&mantissa_str[..dot_pos], &mantissa_str[dot_pos + 1..])
     } else {
         (mantissa_str, "")
     };
 
-    // Filter underscores for WAT compatibility
     let int_clean: String = int_str.chars().filter(|&c| c != '_').collect();
     let frac_clean: String = frac_str.chars().filter(|&c| c != '_').collect();
 
-    // Must have at least one hex digit
     if int_clean.is_empty() && frac_clean.is_empty() {
         return None;
     }
 
-    // Parse integer part
-    let int_val = if int_clean.is_empty() {
-        0u64
-    } else {
-        u64::from_str_radix(&int_clean, 16).ok()?
-    };
+    // Accumulate hex digits into a u64 significand.
+    // 60 bits gives enough room for the target precision (max 53 for f64)
+    // plus guard/round/sticky bits for correct rounding.
+    let mut sig: u64 = 0;
+    let mut sig_bits: u32 = 0;
+    let mut overflow_bits: u32 = 0;
+    let mut sticky = false;
 
-    // Build mantissa: integer part + fractional part
-    let mut mantissa = int_val as f64;
-
-    // Add fractional part: each hex digit contributes digit / 16^position
-    for (i, c) in frac_clean.chars().enumerate() {
-        let digit = c.to_digit(16)? as f64;
-        // 16^(i+1) = 2^(4*(i+1))
-        let shift = 4 * (i as u32 + 1);
-        if shift < 64 {
-            let divisor = (1_u64 << shift) as f64;
-            mantissa += digit / divisor;
+    for c in int_clean.chars() {
+        let d = c.to_digit(16)? as u64;
+        if sig_bits < 60 {
+            sig = (sig << 4) | d;
+            sig_bits += 4;
+        } else {
+            overflow_bits += 4;
+            if d != 0 {
+                sticky = true;
+            }
         }
-        // Beyond 64 bits of precision, additional digits don't matter for f64
     }
 
-    if mantissa == 0.0 {
-        return Some(if negative { -0.0 } else { 0.0 });
+    let mut frac_digit_count: u32 = 0;
+    for c in frac_clean.chars() {
+        let d = c.to_digit(16)? as u64;
+        frac_digit_count += 1;
+        if sig_bits < 60 {
+            sig = (sig << 4) | d;
+            sig_bits += 4;
+        } else {
+            overflow_bits += 4;
+            if d != 0 {
+                sticky = true;
+            }
+        }
     }
 
-    // Apply exponent using repeated multiply/divide to maintain precision
-    // Use steps of 30 bits to stay well within f64 and u64 range
-    let value = if exponent >= 0 {
-        let mut result = mantissa;
-        let mut exp = exponent;
-        while exp > 0 {
-            let step = exp.min(30);
-            result *= (1_u64 << step) as f64;
-            exp -= step;
-        }
-        result
+    let sign_bit = if negative { 1u64 << (p.total_bits - 1) } else { 0 };
+
+    if sig == 0 {
+        return Some(sign_bit);
+    }
+
+    // sig contains at most 60 bits of the full mantissa. Overflow digits
+    // that didn't fit were dropped (tracked via sticky). The value is:
+    // full_mantissa × 2^(parsed_exp - 4 * frac_digit_count)
+    // = sig × 2^overflow_bits × 2^(parsed_exp - 4 * frac_digit_count)
+    let exp = parsed_exp - 4 * frac_digit_count as i64 + overflow_bits as i64;
+
+    // Normalise: strip leading zero-nibbles that were accumulated
+    // (e.g. integer part "0" contributes 4 zero bits)
+    let leading = sig.leading_zeros();
+    let msb = 63 - leading; // position of MSB (0-indexed)
+
+    // Unbiased IEEE exponent: value = (sig / 2^msb) × 2^(exp + msb) = 1.xxx × 2^result_exp
+    let mut result_exp = exp + msb as i64;
+
+    // Total precision including implicit 1 bit
+    let full_prec = p.sig_bits + 1; // 24 for f32, 53 for f64
+    let current_bits = msb + 1; // significant bits in sig
+
+    // Minimum exponent for subnormal values
+    let min_subnormal_exp = p.exp_min - p.sig_bits as i64; // -149 for f32, -1074 for f64
+
+    // Determine target precision
+    let target_prec = if result_exp >= p.exp_min {
+        full_prec
+    } else if result_exp >= min_subnormal_exp {
+        // Subnormal: reduced precision.
+        // The subnormal significand field represents value × 2^(-min_subnormal_exp),
+        // so our MSB at result_exp maps to bit (result_exp - min_subnormal_exp),
+        // giving (result_exp - min_subnormal_exp + 1) bits of precision.
+        (result_exp - min_subnormal_exp + 1) as u32
+    } else if result_exp == min_subnormal_exp - 1 {
+        // Borderline: may round up to minimum subnormal
+        // Use 1-bit precision to evaluate rounding
+        0
     } else {
-        let mut result = mantissa;
-        let mut exp = -exponent;
-        while exp > 0 {
-            let step = exp.min(30);
-            result /= (1_u64 << step) as f64;
-            exp -= step;
-        }
-        result
+        // Deep underflow → zero
+        return Some(sign_bit);
     };
 
-    Some(if negative { -value } else { value })
+    // Handle borderline underflow (result_exp == min_subnormal_exp - 1)
+    if target_prec == 0 {
+        // The value is between 0 and min_subnormal. Check if it rounds up.
+        // Midpoint = 2^(min_subnormal_exp) / 2 = 2^(min_subnormal_exp - 1)
+        // Our value = sig × 2^exp, with MSB at result_exp = min_subnormal_exp - 1
+        // Value = [1.xxx...] × 2^(min_subnormal_exp - 1)
+        // Midpoint = 0.5 × 2^(min_subnormal_exp) = 1.0 × 2^(min_subnormal_exp - 1)
+        // So the midpoint is when sig is exactly a power of 2 (only MSB set) and !sticky
+        let exact_power = sig == (1u64 << msb) && !sticky;
+        if exact_power {
+            // Exactly at midpoint — round to even. 0 is even, so round down.
+            return Some(sign_bit);
+        }
+        // Any additional bits mean we're above the midpoint → round up to min subnormal
+        return Some(sign_bit | 1);
+    }
+
+    let (rounded_sig, carry) = round_to_precision(sig, current_bits, target_prec, sticky);
+
+    if carry {
+        result_exp += 1;
+    }
+
+    // Check overflow → infinity
+    if result_exp > p.exp_max {
+        // Infinity: all exponent bits set, zero significand
+        let inf_exp = ((p.exp_max + p.exp_bias) as u64 + 1) << p.sig_bits;
+        return Some(sign_bit | inf_exp);
+    }
+
+    if result_exp >= p.exp_min {
+        // Normal number
+        let biased_exp = (result_exp + p.exp_bias) as u64;
+        let sig_field = rounded_sig & ((1u64 << p.sig_bits) - 1); // strip implicit 1
+        Some(sign_bit | (biased_exp << p.sig_bits) | sig_field)
+    } else {
+        // Subnormal (exponent field = 0).
+        // Carry shifts the MSB up one position in the subnormal field.
+        let sig_field = if carry { rounded_sig << 1 } else { rounded_sig };
+        Some(sign_bit | sig_field)
+    }
+}
+
+/// Round a significand to the target number of bits using IEEE 754 round-half-to-even.
+///
+/// Returns (rounded_significand, carry) where carry is true if rounding
+/// caused the significand to overflow its target width.
+fn round_to_precision(sig: u64, current_bits: u32, target_bits: u32, sticky: bool) -> (u64, bool) {
+    if current_bits <= target_bits {
+        // Already fits — shift left to fill target width, no rounding needed
+        if current_bits < target_bits {
+            (sig << (target_bits - current_bits), false)
+        } else {
+            (sig, false)
+        }
+    } else {
+        let shift = current_bits - target_bits;
+        let half = 1u64 << (shift - 1);
+        let mask = (1u64 << shift) - 1;
+        let truncated = sig >> shift;
+        let remainder = sig & mask;
+
+        let round_up = if remainder > half || (remainder == half && sticky) {
+            true // above midpoint
+        } else if remainder == half {
+            truncated & 1 != 0 // ties to even
+        } else {
+            false // below midpoint
+        };
+
+        if round_up {
+            let rounded = truncated + 1;
+            if rounded >= (1u64 << target_bits) {
+                (rounded >> 1, true)
+            } else {
+                (rounded, false)
+            }
+        } else {
+            (truncated, false)
+        }
+    }
+}
+
+fn parse_hex_float_f64(s: &str, negative: bool) -> Option<f64> {
+    let bits = parse_hex_float_bits(s, negative, &F64_PARAMS)?;
+    Some(f64::from_bits(bits))
 }
 
 fn parse_hex_float_f32(s: &str, negative: bool) -> Option<f32> {
-    // Use f64 for intermediate precision, then convert
-    let value = parse_hex_float_f64(s, false)?;
-    let result = value as f32;
-    Some(if negative { -result } else { result })
+    let bits = parse_hex_float_bits(s, negative, &F32_PARAMS)?;
+    Some(f32::from_bits(bits as u32))
 }
 
 // =============================================================================
@@ -707,6 +853,128 @@ mod tests {
                 hex
             );
         }
+    }
+
+    // =========================================================================
+    // Precision rounding tests (double-rounding edge cases from WebAssembly
+    // spec const.wast). These hex literals have more precision than f32 can
+    // represent, so correct IEEE 754 round-half-to-even is essential.
+    // =========================================================================
+
+    #[test]
+    fn test_f32_double_rounding_midpoint() {
+        // Exactly at midpoint between 0x1.000000p-50 and 0x1.000002p-50.
+        // Ties to even: the even significand is 0x1.000000 (LSB = 0), so round down.
+        let v = f32::from_hex("0x1.00000100000000000p-50").unwrap();
+        assert_eq!(
+            v.to_bits(),
+            f32::from_hex("0x1.000000p-50").unwrap().to_bits(),
+            "midpoint should round to even (down)"
+        );
+
+        // Same midpoint test at positive exponent
+        let v = f32::from_hex("0x1.00000100000000000p+50").unwrap();
+        assert_eq!(
+            v.to_bits(),
+            f32::from_hex("0x1.000000p+50").unwrap().to_bits(),
+            "midpoint should round to even (down) at p+50"
+        );
+    }
+
+    #[test]
+    fn test_f32_double_rounding_above_midpoint() {
+        // Just above midpoint — should round up regardless of even/odd.
+        let v = f32::from_hex("0x1.00000100000000001p-50").unwrap();
+        assert_eq!(
+            v.to_bits(),
+            f32::from_hex("0x1.000002p-50").unwrap().to_bits(),
+            "above midpoint should round up"
+        );
+
+        let v = f32::from_hex("0x1.00000100000000001p+50").unwrap();
+        assert_eq!(
+            v.to_bits(),
+            f32::from_hex("0x1.000002p+50").unwrap().to_bits(),
+            "above midpoint should round up at p+50"
+        );
+    }
+
+    #[test]
+    fn test_f32_double_rounding_below_midpoint() {
+        // Just below midpoint — should round down (truncate).
+        let v = f32::from_hex("0x1.000000fffffffffffffp-50").unwrap();
+        assert_eq!(
+            v.to_bits(),
+            f32::from_hex("0x1.000000p-50").unwrap().to_bits(),
+            "below midpoint should round down"
+        );
+    }
+
+    #[test]
+    fn test_f32_double_rounding_odd_midpoint() {
+        // Midpoint between 0x1.000002p-50 and 0x1.000004p-50.
+        // Ties to even: 0x1.000002 has LSB = 1 (odd), so round up to 0x1.000004.
+        let v = f32::from_hex("0x1.00000300000000000p-50").unwrap();
+        assert_eq!(
+            v.to_bits(),
+            f32::from_hex("0x1.000004p-50").unwrap().to_bits(),
+            "odd midpoint should round to even (up)"
+        );
+    }
+
+    #[test]
+    fn test_f32_subnormal_carry() {
+        // 0x0.00000300000000000p-126 = 3 × 2^(-150) = 1.5 × 2^(-149)
+        // Exactly halfway between subnormal 1 (2^-149) and subnormal 2 (2^-148).
+        // Subnormal 1 is odd (bit 0 = 1), subnormal 2 is even (bit 1 = 1).
+        // Ties to even → round up to subnormal 2 (f32 bits = 0x00000002).
+        let v = f32::from_hex("0x0.00000300000000000p-126").unwrap();
+        assert_eq!(v.to_bits(), 0x00000002, "subnormal carry should produce sig_field=2");
+
+        // Just above halfway → round up regardless
+        let v = f32::from_hex("0x0.00000300000000001p-126").unwrap();
+        assert_eq!(v.to_bits(), 0x00000002, "above subnormal midpoint should round up");
+
+        // Just below halfway → round down
+        let v = f32::from_hex("0x0.000002fffffp-126").unwrap();
+        assert_eq!(v.to_bits(), 0x00000001, "below subnormal midpoint should round down");
+    }
+
+    #[test]
+    fn test_f32_overflow_to_infinity() {
+        // Just above max f32 → should round to infinity
+        let v = f32::from_hex("0x1.ffffffp+127").unwrap();
+        assert!(v.is_infinite(), "should overflow to infinity");
+    }
+
+    #[test]
+    fn test_f32_max_normal() {
+        // Exactly at max f32 boundary
+        let v = f32::from_hex("0x1.fffffep+127").unwrap();
+        assert_eq!(v, f32::MAX);
+    }
+
+    #[test]
+    fn test_f32_long_mantissa() {
+        // Very long mantissa (>16 hex digits) with extra precision
+        let v = f32::from_hex("0x1.000000000000000000000000000000000000000001p+0").unwrap();
+        assert_eq!(v.to_bits(), 0x3F800000, "long mantissa with trailing 1 should round up");
+
+        // All zeros after — exact value
+        let v = f32::from_hex("0x1.000000000000000000000000000000000000000000p+0").unwrap();
+        assert_eq!(v.to_bits(), 0x3F800000, "long mantissa all zeros is exact 1.0");
+    }
+
+    #[test]
+    fn test_f64_long_mantissa() {
+        // f64 with very long mantissa
+        let v = f64::from_hex("0x1.0000000000000800000000000000000000000000001p+0").unwrap();
+        // 0x0000000000000 + round up from the 8 at position 14 (53rd bit onwards)
+        assert_eq!(
+            v.to_bits(),
+            0x3FF0000000000001,
+            "f64 long mantissa above midpoint should round up"
+        );
     }
 
     // =========================================================================
