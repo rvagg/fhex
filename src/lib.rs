@@ -467,6 +467,8 @@ fn parse_hex_float_bits(s: &str, negative: bool, p: &HexFloatParams) -> Option<u
     // Accumulate hex digits into a u64 significand.
     // 60 bits gives enough room for the target precision (max 53 for f64)
     // plus guard/round/sticky bits for correct rounding.
+    // Leading zero nibbles are skipped to maximise useful precision in
+    // the accumulator (they don't affect the value).
     let mut sig: u64 = 0;
     let mut sig_bits: u32 = 0;
     let mut overflow_bits: u32 = 0;
@@ -474,6 +476,9 @@ fn parse_hex_float_bits(s: &str, negative: bool, p: &HexFloatParams) -> Option<u
 
     for c in int_clean.chars() {
         let d = c.to_digit(16)? as u64;
+        if sig == 0 && d == 0 {
+            continue;
+        }
         if sig_bits < 60 {
             sig = (sig << 4) | d;
             sig_bits += 4;
@@ -489,6 +494,9 @@ fn parse_hex_float_bits(s: &str, negative: bool, p: &HexFloatParams) -> Option<u
     for c in frac_clean.chars() {
         let d = c.to_digit(16)? as u64;
         frac_digit_count += 1;
+        if sig == 0 && d == 0 {
+            continue;
+        }
         if sig_bits < 60 {
             sig = (sig << 4) | d;
             sig_bits += 4;
@@ -975,6 +983,29 @@ mod tests {
             0x3FF0000000000001,
             "f64 long mantissa above midpoint should round up"
         );
+    }
+
+    #[test]
+    fn test_f64_leading_zero_hex_integer() {
+        // 0x0123456789ABCDEFabcdef is a 21-digit hex integer (84 bits).
+        // The leading '0' nibble must not waste accumulator space, otherwise
+        // the 'F' digit (needed for rounding) overflows into sticky and the
+        // result is off by 1 ULP.
+        // Correct f64: 0x1.23456789abcdfp+80 (rounds up from ...CDE due to Fabcdef tail)
+        let v = f64::from_hex("0x0123456789ABCDEFabcdef").unwrap();
+        assert_eq!(
+            v.to_bits(),
+            0x44F23456789ABCDF,
+            "leading-zero hex integer should round correctly"
+        );
+
+        // Without leading zero, same value
+        let v2 = f64::from_hex("0x123456789ABCDEFabcdef").unwrap();
+        assert_eq!(v.to_bits(), v2.to_bits(), "leading zero should not affect result");
+
+        // Hex float form should match
+        let v3 = f64::from_hex("0x1.23456789abcdfp+80").unwrap();
+        assert_eq!(v.to_bits(), v3.to_bits(), "integer form should match float form");
     }
 
     // =========================================================================
